@@ -1,0 +1,64 @@
+cat > .gitignore << EOL
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# Cache directories
+cache/
+.cache/
+
+# Model files
+*.model
+*.pickle
+*.pkl
+*.h5
+*.pt
+*.bin
+model_offload/
+
+# Data and results
+data/
+results/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+EOL
+
+# other
+AMIA-Submission-Template.zip
+Final_Project_SYSEN5630.pdf
