@@ -13,7 +13,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import gc
 import argparse
-import warnings
 import logging
 
 # Setup logging
@@ -40,6 +39,9 @@ class MCRAGConfig:
     quantization: bool = True
     retrieval_k: int = 5
     retrieval_mode: str = "hybrid"
+    mrsty_path: Optional[str] = None 
+    use_umls_linking: bool = True  # New parameter to control UMLS linking
+    umls_confidence_threshold: float = 0.7  # Threshold for UMLS entity confidence
     
     def __post_init__(self):
         # Determine optimal device if not specified
@@ -78,6 +80,17 @@ def import_transformers():
     from transformers import AutoTokenizer, AutoModelForCausalLM
     return AutoTokenizer, AutoModelForCausalLM
 
+def import_datasets():
+    from datasets import load_dataset
+    return load_dataset
+
+# New import function for scispaCy components
+def import_scispacy():
+    from scispacy.umls_linking import UmlsEntityLinker
+    from scispacy.abbreviation import AbbreviationDetector
+    return UmlsEntityLinker, AbbreviationDetector
+
+
 # Optimized document processor
 class OptimizedDocumentProcessor:
     def __init__(self, config: MCRAGConfig):
@@ -90,10 +103,123 @@ class OptimizedDocumentProcessor:
         )
         # Lazy load embedding model only when needed
         self._embedding_model = None
+        
+        # New attributes for UMLS and scispaCy components
+        self._spacy_nlp = None
+        self._umls_linker = None
+
         self.semantic_type_cache = {}
         
         # Pre-compile regex patterns for faster metadata extraction
         self._compile_regex_patterns()
+        
+        # Initialize UMLS dataset loader (lazy loaded)
+        self._umls_dataset = None
+        self._umls_mapping = None
+    
+    def _load_spacy_model(self):
+        """Lazy-load the spaCy model"""
+        if self._spacy_nlp is None:
+            import spacy
+            try:
+                print("Loading en_core_sci_lg model...")
+                self._spacy_nlp = spacy.load("en_core_sci_lg")
+                print("Successfully loaded en_core_sci_sm model")
+                
+                # Add pipeline components using the updated spaCy API
+                if self.config.use_umls_linking:
+                    self._setup_scispacy_components()
+                
+                return True
+            except OSError:
+                print("Model not found, attempting to download...")
+                try:
+                    spacy.cli.download("en_core_sci_sm")
+                    self._spacy_nlp = spacy.load("en_core_sci_sm")
+                    print("Successfully downloaded and loaded en_core_sci_sm model")
+                    
+                    # Add pipeline components using the updated spaCy API
+                    if self.config.use_umls_linking:
+                        self._setup_scispacy_components()
+                    
+                    return True
+                except Exception as e:
+                    print(f"Failed to download model: {e}")
+                    self._spacy_nlp = None
+                    return False
+        return True
+    
+    def _setup_scispacy_components(self):
+        """Set up scispaCy components with proper factory registration"""
+        try:
+            # Import the components
+            from scispacy.abbreviation import AbbreviationDetector
+            from scispacy.linking import EntityLinker   
+            import spacy
+
+            self._spacy_nlp.add_pipe("abbreviation_detector")
+
+            self._spacy_nlp.add_pipe("scispacy_linker", config={"resolve_abbreviations": True, "linker_name": "umls"})
+            self._umls_linker = self._spacy_nlp.get_pipe("scispacy_linker")
+            
+            return True
+        except Exception as e:
+            print(f"Error setting up scispaCy components: {e}")
+            return False
+        
+    def _load_umls_semantic_types(self, mrsty_file_path=None):
+        """
+        Load semantic type mappings from MRSTY.RRF file
+        
+        Args:
+            mrsty_file_path: Path to the MRSTY.RRF file, defaults to config value
+        """
+        # Use path from config if not specified
+        if mrsty_file_path is None:
+            mrsty_file_path = getattr(self.config, 'mrsty_path', '/data/MRSTY.RRF')
+        
+        self.semantic_type_map = {}
+        
+        try:
+            # Check if file exists
+            if not os.path.exists(mrsty_file_path):
+                print(f"MRSTY.RRF file not found at {mrsty_file_path}")
+                return
+                
+            print(f"Loading UMLS semantic type mappings from {mrsty_file_path}...")
+            # Process the file with efficient line-by-line reading
+            total_lines = 0
+            with open(mrsty_file_path, 'r', encoding='utf-8') as f:
+                for i, line in enumerate(f):
+                    # Display progress periodically
+                    if i % 100000 == 0 and i > 0:
+                        print(f"Processed {i} semantic type mappings...")
+                    total_lines += 1
+                    
+                    # Parse the line: CUI|TUI|STN|STY|ATUI|CVF
+                    parts = line.strip().split('|')
+                    if len(parts) >= 4:
+                        cui = parts[0]
+                        tui = parts[1]
+                        sty = parts[3]  # Semantic type name
+                        
+                        # Initialize list for CUI if not exists
+                        if cui not in self.semantic_type_map:
+                            self.semantic_type_map[cui] = []
+                        
+                        # Add this semantic type if not already present
+                        if not any(st['tui'] == tui for st in self.semantic_type_map[cui]):
+                            self.semantic_type_map[cui].append({
+                                'tui': tui,
+                                'name': sty
+                            })
+            
+            print(f"Loaded semantic types for {len(self.semantic_type_map)} concepts from {total_lines} entries")
+        except Exception as e:
+            print(f"Error loading semantic type mappings: {e}")
+            # Initialize empty map in case of error
+            self.semantic_type_map = {}
+
     
     def _compile_regex_patterns(self):
         """Pre-compile regex patterns for faster metadata extraction"""
@@ -194,7 +320,11 @@ class OptimizedDocumentProcessor:
         if batch_size is None:
             batch_size = self.config.batch_size
         
-        # Try to use advanced NLP first
+        # First, initialize the spaCy model and UMLS components if UMLS linking is enabled
+        if self.config.use_umls_linking and self._spacy_nlp is None:
+            self._load_spacy_model()
+        
+        # Try to use advanced NLP with direct UMLS linking
         success = self._enrich_with_advanced_nlp(chunks, batch_size)
         
         # Fall back to simple pattern matching if advanced NLP fails
@@ -206,7 +336,7 @@ class OptimizedDocumentProcessor:
     
     def _enrich_with_advanced_nlp(self, chunks, batch_size):
         """
-        Enhanced metadata enrichment using advanced NLP with en_core_sci_lg and UMLS linking
+        Enhanced metadata enrichment using advanced NLP with direct UMLS linking
         
         Args:
             chunks: List of document chunks to process
@@ -216,121 +346,128 @@ class OptimizedDocumentProcessor:
             bool: True if successful, False if failed
         """
         try:
-            # Import required libraries
-            import spacy
-            import re
-            from spacy.tokens.span import Span
+            # Check if spaCy model is ready
+            if self._spacy_nlp is None and not self._load_spacy_model():
+                return False
             
-            # Load specialized biomedical NLP model
-            try:
-                print("Loading en_core_sci_lg model...")
-                nlp = spacy.load("en_core_sci_lg")
-                print("Successfully loaded en_core_sci_lg model")
-            except OSError:
-                # If model not found, try to download it
-                print("Model not found, attempting to download...")
-                try:
-                    spacy.cli.download("en_core_sci_lg")
-                    nlp = spacy.load("en_core_sci_lg")
-                    print("Successfully downloaded and loaded en_core_sci_lg model")
-                except Exception as e:
-                    print(f"Failed to download model: {e}")
-                    return False
-            
-            # Add UMLS entity linker
-            try:
-                from scispacy.linking import EntityLinker
-                
-                # Register the entity linker if not already present
-                if "scispacy_linker_umls" not in nlp.pipe_names:
-                    # Define a factory for the entity linker
-                    @spacy.Language.factory("scispacy_linker_umls")
-                    def create_entity_linker(nlp, name):
-                        return EntityLinker(nlp, name="umls", resolve_abbreviations=True)
-                    
-                    # Add the entity linker to the pipeline
-                    nlp.add_pipe("scispacy_linker_umls")
-                    print("Added UMLS entity linker to pipeline")
-            except ImportError as e:
-                print(f"EntityLinker not available: {e}")
-                # Continue without entity linking
-            
-            # Set up custom extensions for negation if not already present
-            if not Span.has_extension("is_negated"):
-                Span.set_extension("is_negated", default=False)
-            
-            # Add custom negation detection
-            # First, create a proper component class instead of a direct function
-            @spacy.Language.factory("negation_detector")
-            class NegationDetector:
-                def __init__(self, nlp, name):
-                    self.name = name
-                    self.nlp = nlp
-                    # Common medical negation terms
-                    self.negation_terms = ["no", "not", "none", "negative", "deny", "denies", 
-                                          "denied", "absent", "without", "non", "ruled out"]
-                    self.window_size = 5  # Words to look before/after entity
-                
-                def __call__(self, doc):
-                    """Process the document, marking entities as negated where appropriate"""
-                    for ent in doc.ents:
-                        # Default: not negated
-                        ent._.set("is_negated", False)
-                        
-                        # Check before entity
-                        start = max(0, ent.start - self.window_size)
-                        prefix = doc[start:ent.start]
-                        
-                        # Check after entity
-                        end = min(len(doc), ent.end + self.window_size)
-                        suffix = doc[ent.end:end]
-                        
-                        # Mark as negated if negation term found
-                        for token in list(prefix) + list(suffix):
-                            if token.lower_ in self.negation_terms:
-                                ent._.set("is_negated", True)
-                                break
-                    
-                    return doc
-            
-            # Add negation component to pipeline if not already there
-            if "negation_detector" not in nlp.pipe_names:
-                nlp.add_pipe("negation_detector")
-                print("Added custom negation detector")
-            
-            # Define semantic type mappings
+            # Define category mappings based on official UMLS semantic groups
             category_mappings = {
-                # Conditions/Diseases
+                # Conditions/Diseases (DISO - Disorders semantic group)
                 "conditions": [
-                    "T047",  # Disease or Syndrome
-                    "T048",  # Mental/Behavioral Dysfunction
+                    "T020",  # Acquired Abnormality
+                    "T190",  # Anatomical Abnormality
+                    "T049",  # Cell or Molecular Dysfunction
                     "T019",  # Congenital Abnormality
-                    "T046",  # Pathologic Function
-                    "T184",  # Sign or Symptom
+                    "T047",  # Disease or Syndrome
                     "T050",  # Experimental Model of Disease
                     "T033",  # Finding
+                    "T037",  # Injury or Poisoning
+                    "T048",  # Mental or Behavioral Dysfunction
+                    "T191",  # Neoplastic Process
+                    "T046",  # Pathologic Function
+                    "T184",  # Sign or Symptom
                 ],
                 
-                # Medications
+                # Medications (CHEM - Chemicals & Drugs semantic group)
                 "medications": [
-                    "T121",  # Pharmacologic Substance
-                    "T122",  # Biomedical or Dental Material
+                    "T116",  # Amino Acid, Peptide, or Protein
+                    "T195",  # Antibiotic
                     "T123",  # Biologically Active Substance
+                    "T122",  # Biomedical or Dental Material
+                    "T103",  # Chemical
+                    "T120",  # Chemical Viewed Functionally
+                    "T104",  # Chemical Viewed Structurally
+                    "T200",  # Clinical Drug
+                    "T196",  # Element, Ion, or Isotope
+                    "T126",  # Enzyme
                     "T131",  # Hazardous or Poisonous Substance
+                    "T125",  # Hormone
+                    "T129",  # Immunologic Factor
+                    "T130",  # Indicator, Reagent, or Diagnostic Aid
+                    "T197",  # Inorganic Chemical
+                    "T114",  # Nucleic Acid, Nucleoside, or Nucleotide
+                    "T109",  # Organic Chemical
+                    "T121",  # Pharmacologic Substance
+                    "T192",  # Receptor
+                    "T127",  # Vitamin
                 ],
                 
-                # Procedures
+                # Procedures (PROC - Procedures semantic group)
                 "procedures": [
                     "T060",  # Diagnostic Procedure
-                    "T061",  # Therapeutic or Preventive Procedure
+                    "T065",  # Educational Activity
+                    "T058",  # Health Care Activity
                     "T059",  # Laboratory Procedure
+                    "T063",  # Molecular Biology Research Technique
+                    "T062",  # Research Activity
+                    "T061",  # Therapeutic or Preventive Procedure
                 ],
                 
-                # Lab tests
+                # Lab tests (PHEN - Phenomena semantic group, focused on lab results)
                 "lab_tests": [
                     "T034",  # Laboratory or Test Result
+                    "T059",  # Laboratory Procedure (duplicate from procedures, but important for lab tests)
+                    "T201",  # Clinical Attribute (from PHYS group)
+                    "T067",  # Phenomenon or Process
+                ],
+                
+                # Anatomy (ANAT - Anatomy semantic group)
+                "anatomy": [
+                    "T017",  # Anatomical Structure
+                    "T029",  # Body Location or Region
+                    "T023",  # Body Part, Organ, or Organ Component
+                    "T030",  # Body Space or Junction
+                    "T031",  # Body Substance
+                    "T022",  # Body System
+                    "T025",  # Cell
+                    "T026",  # Cell Component
+                    "T018",  # Embryonic Structure
+                    "T021",  # Fully Formed Anatomical Structure
+                    "T024",  # Tissue
+                ],
+                
+                # Patient demographics (LIVB - Living Beings semantic group, focused on groups)
+                "demographics": [
+                    "T100",  # Age Group
+                    "T099",  # Family Group
+                    "T096",  # Group
+                    "T016",  # Human
+                    "T101",  # Patient or Disabled Group
+                    "T098",  # Population Group
+                    "T097",  # Professional or Occupational Group
+                ],
+                
+                # Devices (DEVI - Devices semantic group)
+                "devices": [
+                    "T203",  # Drug Delivery Device
+                    "T074",  # Medical Device
+                    "T075",  # Research Device
+                ],
+                
+                # Physiology (PHYS - Physiology semantic group)
+                "physiology": [
+                    "T043",  # Cell Function
                     "T201",  # Clinical Attribute
-                    "T196",  # Element, Ion, or Isotope
+                    "T045",  # Genetic Function
+                    "T041",  # Mental Process
+                    "T044",  # Molecular Function
+                    "T032",  # Organism Attribute
+                    "T040",  # Organism Function
+                    "T042",  # Organ or Tissue Function
+                    "T039",  # Physiologic Function
+                ],
+                
+                # Activities & Behaviors (ACTI - Activities & Behaviors semantic group)
+                "behaviors": [
+                    "T052",  # Activity
+                    "T053",  # Behavior
+                    "T056",  # Daily or Recreational Activity
+                    "T051",  # Event
+                    "T064",  # Governmental or Regulatory Activity
+                    "T055",  # Individual Behavior
+                    "T066",  # Machine Activity
+                    "T057",  # Occupational Activity
+                    "T054",  # Social Behavior
                 ],
             }
             
@@ -341,7 +478,7 @@ class OptimizedDocumentProcessor:
                 
                 # Process with NLP pipeline in batches
                 try:
-                    docs = list(nlp.pipe(texts, batch_size=min(batch_size, 8)))
+                    docs = list(self._spacy_nlp.pipe(texts, batch_size=min(batch_size, 8)))
                 except Exception as e:
                     print(f"Error in NLP processing: {e}")
                     continue
@@ -357,65 +494,96 @@ class OptimizedDocumentProcessor:
                     for category in category_mappings:
                         chunk.metadata[category] = []
                     
+                    # Add a container for all UMLS entities
+                    chunk.metadata["umls_entities"] = []
+                    
                     # Track found entities to avoid duplicates
                     entities_found = {category: set() for category in category_mappings}
                     
-                    # Process entities
-                    for ent in doc.ents:
-                        # Skip negated entities
-                        if ent._.get("is_negated", False):
-                            continue
+                    # Handle abbreviations if present
+                    if hasattr(doc._, 'abbreviations'):
+                        abbreviations = {}
+                        for abrv in doc._.abbreviations:
+                            abbreviations[abrv.text] = abrv._.long_form.text
+                        chunk.metadata['abbreviations'] = abbreviations
+                    
+                    # Process entities with direct UMLS linking
+                    for entity in doc.ents:
+                        entity_text = entity.text
+                        entity_text_lower = entity_text.lower()
                         
-                        entity_text = ent.text.lower()
-                        entity_label = ent.label_
-                        linked = False
-                        
-                        # Try UMLS linking if available
-                        if hasattr(ent._, "kb_ents") and ent._.kb_ents:
-                            kb_entities = ent._.kb_ents
+                        # Check if UMLS linker is available and entity has UMLS links
+                        if self.config.use_umls_linking:
+                            umls_linked = False
                             
-                            if kb_entities and len(kb_entities) > 0:
-                                # Get top UMLS entity
-                                umls_entity = kb_entities[0]
-                                cui = umls_entity[0]  # Concept ID
-                                score = umls_entity[1]  # Confidence score
+                            # Process top UMLS matches
+                            for umls_ent in entity._.kb_ents[:3]:  # Get top 3 matches
+                                cui = umls_ent[0]
+                                score = umls_ent[1]
                                 
                                 # Only use high confidence matches
-                                if score > 0.7:
-                                    # Get semantic types for the concept
-                                    semantic_types = self._get_semantic_types(cui)
-                                    
-                                    # Categorize based on semantic type
-                                    for category, type_codes in category_mappings.items():
-                                        if any(t in type_codes for t in semantic_types):
-                                            # Add if not already found
-                                            if entity_text not in entities_found[category]:
-                                                chunk.metadata[category].append({
-                                                    "text": entity_text,
-                                                    "cui": cui,
-                                                    "confidence": float(score)
-                                                })
-                                                entities_found[category].add(entity_text)
-                                                linked = True
-                        
-                        # For entities not linked to UMLS, use spaCy entity labels
-                        if not linked:
-                            # Map spaCy labels to our categories
-                            if entity_label in ["DISEASE", "PROBLEM"]:
-                                category = "conditions"
-                            elif entity_label in ["CHEMICAL", "DRUG"]:
-                                category = "medications"
-                            elif entity_label in ["PROCEDURE"]:
-                                category = "procedures"
-                            else:
-                                continue  # Skip other entity types
+                                if score > self.config.umls_confidence_threshold:
+                                    try:
+                                        # Get entity details from linker
+                                        umls_entity = self._umls_linker.kb.cui_to_entity[cui]
+                                        
+                                        # Extract semantic types
+                                        semantic_types = []
+                                        for type_string in umls_entity.types:
+                                            # Format is typically "T047_Disease_or_Syndrome"
+                                            parts = type_string.split('_')
+                                            if parts:
+                                                print(f"Extracted semantic type: {parts[0]} for CUI: {cui}")
+                                                semantic_types.append(parts[0])  # Extract "T047"
+                                        
+                                        # Create entity info
+                                        entity_info = {
+                                            "text": entity_text,
+                                            "cui": cui,
+                                            "name": umls_entity.canonical_name,
+                                            "definition": umls_entity.definition if umls_entity.definition else "",
+                                            "score": float(score),
+                                            "semantic_types": semantic_types,
+                                            "aliases": list(umls_entity.aliases)[:5]  # Limit to 5 aliases
+                                        }
+                                        
+                                        # Add to umls_entities list
+                                        chunk.metadata["umls_entities"].append(entity_info)
+                                        
+                                        # Categorize based on semantic types
+                                        for category, type_codes in category_mappings.items():
+                                            if any(t in type_codes for t in semantic_types):
+                                                if entity_text_lower not in entities_found[category]:
+                                                    chunk.metadata[category].append(entity_info)
+                                                    entities_found[category].add(entity_text_lower)
+                                                    umls_linked = True
+                                    except Exception as e:
+                                        print(f"Error processing UMLS entity {cui}: {e}")
+                                        continue
+                            
+                            # If no categories matched but we have UMLS data, add to appropriate category based on entity label
+                            if not umls_linked:
+                                entity_label = entity.label_
+                                category = self._map_entity_label_to_category(entity_label)
                                 
-                            # Add entity if not already found
-                            if entity_text not in entities_found[category]:
-                                chunk.metadata[category].append({"text": entity_text})
-                                entities_found[category].add(entity_text)
+                                if category and entity_text_lower not in entities_found[category]:
+                                    # Use the entity info we already created, if available
+                                    entity_info = next((e for e in chunk.metadata["umls_entities"] 
+                                                      if e["text"].lower() == entity_text_lower), 
+                                                      {"text": entity_text, "source": "spacy"})
+                                    
+                                    chunk.metadata[category].append(entity_info)
+                                    entities_found[category].add(entity_text_lower)
+                        else:
+                            # Fallback to basic entity type mapping
+                            entity_label = entity.label_
+                            category = self._map_entity_label_to_category(entity_label)
+                            
+                            if category and entity_text_lower not in entities_found[category]:
+                                chunk.metadata[category].append({"text": entity_text, "source": "spacy"})
+                                entities_found[category].add(entity_text_lower)
                     
-                    # Create simplified lists
+                    # Create simplified lists for each category
                     for category in category_mappings:
                         chunk.metadata[f"{category}_simple"] = [item["text"] for item in chunk.metadata[category]]
                     
@@ -427,66 +595,143 @@ class OptimizedDocumentProcessor:
         except Exception as e:
             print(f"Advanced NLP enrichment failed: {e}")
             return False
+
+    def _map_entity_label_to_category(self, entity_label):
+        """Map spaCy entity labels to our categories based on UMLS semantic groups"""
+        # Map from standard scispaCy/spaCy entity types to our categories
+        label_to_category = {
+            # Common biomedical entity types
+            "DISEASE": "conditions",
+            "PROBLEM": "conditions",
+            "DX": "conditions",  # Diagnosis abbreviation
+            "DIAGNOSIS": "conditions",
+            "DISORDER": "conditions",
+            "FINDING": "conditions",
+            "SYMPTOM": "conditions",
+            
+            "CHEMICAL": "medications",
+            "DRUG": "medications",
+            "MEDICATION": "medications",
+            "SUBSTANCE": "medications",
+            "RX": "medications",  # Prescription abbreviation
+            
+            "PROCEDURE": "procedures",
+            "TREATMENT": "procedures", 
+            "THERAPY": "procedures",
+            "SURGERY": "procedures",
+            
+            "TEST": "lab_tests",
+            "LAB": "lab_tests",
+            "LABORATORY": "lab_tests",
+            "MEASUREMENT": "lab_tests",
+            
+            "ANATOMY": "anatomy",
+            "BODY": "anatomy",
+            "ORGAN": "anatomy",
+            "TISSUE": "anatomy",
+            "CELL": "anatomy",
+            
+            "DEVICE": "devices",
+            "EQUIPMENT": "devices",
+            
+            "PHYSIOLOGY": "physiology",
+            "FUNCTION": "physiology",
+            
+            "BEHAVIOR": "behaviors",
+            "ACTIVITY": "behaviors",
+            
+            # General entity types that might appear
+            "PERSON": "demographics",
+            "GPE": "demographics",  # Geo-political entity
+            "ORG": "demographics",   # Organization
+            "NORP": "demographics",  # Nationalities, religious, political groups
+        }
+        
+        # Return the mapped category or None if no mapping exists
+        return label_to_category.get(entity_label.upper(), None)
+    
+    def _get_umls_entity_info(self, cui):
+        """
+        Get detailed information for a UMLS concept directly from the linker
+        
+        Args:
+            cui: UMLS Concept Unique Identifier
+                
+        Returns:
+            dict: Entity information including name, definition, and semantic types
+        """
+        if not self.config.use_umls_linking or self._umls_linker is None:
+            return {}
+        
+        try:
+            umls_entity = self._umls_linker.umls.cui_to_entity[cui]
+            
+            # Extract semantic types
+            semantic_types = []
+            for type_string in umls_entity.types:
+                parts = type_string.split('_')
+                if parts:
+                    semantic_types.append(parts[0])
+            
+            # Create entity info dictionary
+            entity_info = {
+                "cui": cui,
+                "name": umls_entity.canonical_name,
+                "definition": umls_entity.definition if umls_entity.definition else "",
+                "semantic_types": semantic_types,
+                "aliases": list(umls_entity.aliases)[:5]  # Limit to avoid excessive data
+            }
+            
+            return entity_info
+        except Exception as e:
+            print(f"Error fetching UMLS entity info for {cui}: {e}")
+            return {}
     
     def _get_semantic_types(self, cui):
         """
-        Get semantic types for a UMLS concept ID, with caching
+        Get semantic types for a UMLS concept ID using the MRSTY.RRF data
         
         Args:
             cui: UMLS Concept Unique Identifier
             
         Returns:
-            List of semantic type codes
+            List of semantic type codes (TUIs)
         """
-        # Check cache first
+        # First try to get from UMLS linker if available
+        if self.config.use_umls_linking and self._umls_linker:
+            try:
+                umls_entity = self._umls_linker.umls.cui_to_entity[cui]
+                semantic_types = []
+                for type_string in umls_entity.types:
+                    parts = type_string.split('_')
+                    if parts:
+                        semantic_types.append(parts[0])
+                return semantic_types
+            except Exception:
+                pass  # Fall back to MRSTY data
+        
+        # Check cache first for efficiency
         if cui in self.semantic_type_cache:
             return self.semantic_type_cache[cui]
         
-        # Try API lookup with retries
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                import requests
-                
-                # UMLS REST API URL
-                url = f"https://uts-ws.nlm.nih.gov/rest/content/current/CUI/{cui}"
-                
-                # Try to get API key from environment
-                import os
-                api_key = os.environ.get("UMLS_API_KEY", "dd107a9b-1977-4faf-b847-dcb8a8783e29")
-                
-                # Make API request
-                response = requests.get(url, params={"apiKey": api_key}, timeout=5)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    semantic_types = []
-                    
-                    # Extract semantic types
-                    if "result" in data and "semanticTypes" in data["result"]:
-                        for st in data["result"]["semanticTypes"]:
-                            if "type" in st:
-                                semantic_types.append(st["type"])
-                            elif "name" in st:
-                                semantic_types.append(st["name"])
-                    
-                    # Cache result
-                    self.semantic_type_cache[cui] = semantic_types
-                    return semantic_types
-                else:
-                    # Retry on server errors
-                    if response.status_code >= 500 and attempt < max_retries - 1:
-                        continue
-                    return []
-                    
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    continue
-                print(f"Error retrieving semantic types for CUI {cui}: {e}")
-                return []
+        # Initialize semantic types list
+        semantic_types = []
         
-        # Return empty list if all retries fail
-        return []
+        # Try to get semantic types from MRSTY.RRF data first
+        if not hasattr(self, 'semantic_type_map') or self.semantic_type_map is None:
+            if hasattr(self.config, 'mrsty_path') and self.config.mrsty_path:
+                self._load_umls_semantic_types()
+            else:
+                self.semantic_type_map = {}
+        
+        if cui in self.semantic_type_map:
+            # Extract just the TUIs
+            semantic_types = [st['tui'] for st in self.semantic_type_map[cui]]
+        
+        # Cache the result
+        self.semantic_type_cache[cui] = semantic_types
+        
+        return semantic_types
     
     def _detect_recommendations(self, chunk):
         """
@@ -559,11 +804,19 @@ class OptimizedDocumentProcessor:
             chunk.metadata["conditions_simple"] = [item["text"] for item in conditions]
             chunk.metadata["medications_simple"] = [item["text"] for item in medications]
             
-            # Also initialize other categories for consistency
-            chunk.metadata["procedures"] = []
-            chunk.metadata["procedures_simple"] = []
-            chunk.metadata["lab_tests"] = []
-            chunk.metadata["lab_tests_simple"] = []
+            # Initialize all categories for consistency (based on our UMLS semantic groups)
+            all_categories = [
+                "procedures", "lab_tests", "anatomy", "devices", 
+                "demographics", "physiology", "behaviors"
+            ]
+            
+            # Initialize empty lists for all categories
+            for category in all_categories:
+                chunk.metadata[category] = []
+                chunk.metadata[f"{category}_simple"] = []
+            
+            # Initialize UMLS entities container
+            chunk.metadata["umls_entities"] = []
             
             # Check for recommendations
             is_recommendation = bool(self.recommendation_regex.search(text))
@@ -619,6 +872,24 @@ class OptimizedDocumentProcessor:
         index.add(embeddings)
         
         return index
+
+    def release_resources(self):
+        """Release memory for heavy components"""
+        # Clear embedding model
+        if self._embedding_model is not None:
+            del self._embedding_model
+            self._embedding_model = None
+        
+        # Clear spaCy and UMLS components
+        if self._spacy_nlp is not None:
+            del self._spacy_nlp
+            self._spacy_nlp = None
+        
+        # Force garbage collection
+        gc.collect()
+
+# The rest of the code (OptimizedRetriever, OptimizedGenerator, OptimizedCache, OptimizedMCRAG, main function)
+# remains the same as in the original mcrag.py file
 
 # Optimized retriever with better search strategies
 class OptimizedRetriever:
@@ -940,21 +1211,51 @@ CLINICAL RECOMMENDATION:
         """Format chunks with metadata to provide better context"""
         formatted_chunks = []
         
+        # Define categories to display in headers with friendly names
+        display_categories = {
+            "conditions": "Conditions",
+            "medications": "Medications",
+            "procedures": "Procedures",
+            "lab_tests": "Lab Tests",
+            "anatomy": "Anatomy",
+            "devices": "Devices",
+            "demographics": "Demographics",
+            "physiology": "Physiology",
+            "behaviors": "Behaviors"
+        }
+        
         for i, chunk in enumerate(chunks):
             # Extract metadata with fallbacks
             source = chunk.metadata.get("source", "Unknown")
             doc_type = chunk.metadata.get("document_type", "Unknown")
             
-            # Include entity information if available
-            conditions = ", ".join(chunk.metadata.get("conditions_simple", []))
-            medications = ", ".join(chunk.metadata.get("medications_simple", []))
-            
-            # Create a header with context
+            # Create header with source info
             header = f"[{i+1}] Source: {source} (Type: {doc_type})"
-            if conditions:
-                header += f" | Conditions: {conditions}"
-            if medications:
-                header += f" | Medications: {medications}"
+            
+            # Add entity information for each category if available
+            for category_key, display_name in display_categories.items():
+                simple_key = f"{category_key}_simple"
+                if simple_key in chunk.metadata and chunk.metadata[simple_key]:
+                    entities = ", ".join(chunk.metadata[simple_key][:5])  # Limit to 5 entities
+                    if entities:
+                        header += f" | {display_name}: {entities}"
+            
+            # Include UMLS entities if available
+            umls_entities = chunk.metadata.get("umls_entities", [])
+            umls_info = ""
+            if umls_entities:
+                top_entities = [f"{e['name']} (CUI: {e['cui']})" for e in umls_entities[:3]]
+                umls_info = f" | Key Concepts: {', '.join(top_entities)}"
+            
+            # Include abbreviations if available
+            abbreviations = chunk.metadata.get("abbreviations", {})
+            abbr_info = ""
+            if abbreviations:
+                abbr_list = [f"{abbr} = {long_form}" for abbr, long_form in list(abbreviations.items())[:3]]
+                abbr_info = f" | Abbreviations: {', '.join(abbr_list)}"
+            
+            # Add UMLS and abbreviation info
+            header += umls_info + abbr_info
             
             # Format the chunk with its header
             formatted_chunk = f"{header}\n{chunk.page_content}"
@@ -1416,10 +1717,8 @@ class OptimizedMCRAG:
             del self._generator
             self._generator = None
         
-        # Clear embedding model
-        if hasattr(self.document_processor, '_embedding_model') and self.document_processor._embedding_model is not None:
-            del self.document_processor._embedding_model
-            self.document_processor._embedding_model = None
+        # Release document processor resources
+        self.document_processor.release_resources()
         
         # Clear retriever components
         if self.retriever is not None:
@@ -1448,6 +1747,7 @@ def main():
     setup_parser.add_argument("--output-dir", default="./results", help="Results directory")
     setup_parser.add_argument("--cache-dir", default="./cache", help="Cache directory")
     setup_parser.add_argument("--no-cache", action="store_true", help="Disable caching")
+    setup_parser.add_argument("--no-umls", action="store_true", help="Disable UMLS linking")
     
     # Query command
     query_parser = subparsers.add_parser("query", help="Process a clinical query")
@@ -1459,6 +1759,7 @@ def main():
                             choices=["random", "top", "diversity", "cluster", "hybrid"], 
                             help="Retrieval mode")
     query_parser.add_argument("--k", type=int, default=5, help="Number of chunks to retrieve")
+    query_parser.add_argument("--no-umls", action="store_true", help="Disable UMLS linking")
     
     # Batch query command
     batch_parser = subparsers.add_parser("batch", help="Process queries from a file")
@@ -1484,7 +1785,8 @@ def main():
             data_dir=args.data_dir,
             output_dir=args.output_dir,
             cache_dir=args.cache_dir,
-            use_cache=not args.no_cache
+            use_cache=not args.no_cache,
+            use_umls_linking=not args.no_umls
         )
         
         # Initialize system
@@ -1500,7 +1802,8 @@ def main():
         config = MCRAGConfig(
             data_dir=args.data_dir,
             output_dir=args.output_dir,
-            cache_dir=args.cache_dir
+            cache_dir=args.cache_dir,
+            use_umls_linking=not args.no_umls
         )
         
         # Initialize system

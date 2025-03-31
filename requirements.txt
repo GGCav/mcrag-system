@@ -1,10 +1,17 @@
 # requirements.txt
-langchain==0.0.267
-langchain-community==0.0.10
-sentence-transformers==2.2.2
+requests
+bs4
+pandas
+PyPDF2
+tqdm
 torch
-transformers==4.30.2
-faiss-cpu==1.7.4
+langchain
+langchain-community
+sentence-transformers
+torch
+spacy
+transformers
+faiss-cpu
 numpy
 pandas
 scikit-learn
