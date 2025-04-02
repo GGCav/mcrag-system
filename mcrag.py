@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MCRAG")
 
-# Configuration class for better organization and flexibility
+# Configuration class with updated embedding configuration
 @dataclass
 class MCRAGConfig:
     data_dir: str
@@ -68,13 +68,11 @@ def import_document_loaders():
     from langchain_community.document_loaders import PyMuPDFLoader, TextLoader
     return PyMuPDFLoader, TextLoader
 
-def import_sentence_transformer():
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer
-
-def import_faiss():
-    import faiss
-    return faiss
+def import_langchain_vectorstores():
+    from langchain_community.vectorstores import FAISS as LangchainFAISS
+    from langchain.schema import Document as LangchainDocument
+    from langchain_huggingface import HuggingFaceEmbeddings
+    return LangchainFAISS, LangchainDocument, HuggingFaceEmbeddings
 
 def import_transformers():
     from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -91,7 +89,7 @@ def import_scispacy():
     return UmlsEntityLinker, AbbreviationDetector
 
 
-# Optimized document processor
+# Optimized document processor fully integrated with Langchain
 class OptimizedDocumentProcessor:
     def __init__(self, config: MCRAGConfig):
         self.config = config
@@ -101,8 +99,9 @@ class OptimizedDocumentProcessor:
             chunk_overlap=config.chunk_overlap,
             separators=["\n\n", "\n", ". ", " ", ""]
         )
-        # Lazy load embedding model only when needed
-        self._embedding_model = None
+        
+        # Use only Langchain embeddings
+        self._langchain_embeddings = None
         
         # New attributes for UMLS and scispaCy components
         self._spacy_nlp = None
@@ -117,6 +116,17 @@ class OptimizedDocumentProcessor:
         self._umls_dataset = None
         self._umls_mapping = None
     
+    @property
+    def langchain_embeddings(self):
+        """Lazy load Langchain's embeddings"""
+        if self._langchain_embeddings is None:
+            _, _, HuggingFaceEmbeddings = import_langchain_vectorstores()
+            self._langchain_embeddings = HuggingFaceEmbeddings(
+                model_name=self.config.embedding_model,
+                model_kwargs={"device": self.config.device}
+            )
+        return self._langchain_embeddings
+    
     def _load_spacy_model(self):
         """Lazy-load the spaCy model"""
         if self._spacy_nlp is None:
@@ -124,7 +134,7 @@ class OptimizedDocumentProcessor:
             try:
                 print("Loading en_core_sci_lg model...")
                 self._spacy_nlp = spacy.load("en_core_sci_lg")
-                print("Successfully loaded en_core_sci_sm model")
+                print("Successfully loaded en_core_sci_lg model")
                 
                 # Add pipeline components using the updated spaCy API
                 if self.config.use_umls_linking:
@@ -166,60 +176,6 @@ class OptimizedDocumentProcessor:
         except Exception as e:
             print(f"Error setting up scispaCy components: {e}")
             return False
-        
-    def _load_umls_semantic_types(self, mrsty_file_path=None):
-        """
-        Load semantic type mappings from MRSTY.RRF file
-        
-        Args:
-            mrsty_file_path: Path to the MRSTY.RRF file, defaults to config value
-        """
-        # Use path from config if not specified
-        if mrsty_file_path is None:
-            mrsty_file_path = getattr(self.config, 'mrsty_path', '/data/MRSTY.RRF')
-        
-        self.semantic_type_map = {}
-        
-        try:
-            # Check if file exists
-            if not os.path.exists(mrsty_file_path):
-                print(f"MRSTY.RRF file not found at {mrsty_file_path}")
-                return
-                
-            print(f"Loading UMLS semantic type mappings from {mrsty_file_path}...")
-            # Process the file with efficient line-by-line reading
-            total_lines = 0
-            with open(mrsty_file_path, 'r', encoding='utf-8') as f:
-                for i, line in enumerate(f):
-                    # Display progress periodically
-                    if i % 100000 == 0 and i > 0:
-                        print(f"Processed {i} semantic type mappings...")
-                    total_lines += 1
-                    
-                    # Parse the line: CUI|TUI|STN|STY|ATUI|CVF
-                    parts = line.strip().split('|')
-                    if len(parts) >= 4:
-                        cui = parts[0]
-                        tui = parts[1]
-                        sty = parts[3]  # Semantic type name
-                        
-                        # Initialize list for CUI if not exists
-                        if cui not in self.semantic_type_map:
-                            self.semantic_type_map[cui] = []
-                        
-                        # Add this semantic type if not already present
-                        if not any(st['tui'] == tui for st in self.semantic_type_map[cui]):
-                            self.semantic_type_map[cui].append({
-                                'tui': tui,
-                                'name': sty
-                            })
-            
-            print(f"Loaded semantic types for {len(self.semantic_type_map)} concepts from {total_lines} entries")
-        except Exception as e:
-            print(f"Error loading semantic type mappings: {e}")
-            # Initialize empty map in case of error
-            self.semantic_type_map = {}
-
     
     def _compile_regex_patterns(self):
         """Pre-compile regex patterns for faster metadata extraction"""
@@ -251,13 +207,6 @@ class OptimizedDocumentProcessor:
         self.condition_regex = re.compile(r'\b(' + '|'.join(self.condition_patterns) + r')\b', re.IGNORECASE)
         self.medication_regex = re.compile(r'\b(' + '|'.join(self.medication_patterns) + r')\b', re.IGNORECASE)
         self.recommendation_regex = re.compile('|'.join(self.recommendation_patterns), re.IGNORECASE)
-    
-    @property
-    def embedding_model(self):
-        if self._embedding_model is None:
-            SentenceTransformer = import_sentence_transformer()
-            self._embedding_model = SentenceTransformer(self.config.embedding_model)
-        return self._embedding_model
     
     def process_documents(self, file_paths, metadata=None, use_parallel=True):
         """Process multiple documents in parallel for better performance"""
@@ -335,16 +284,7 @@ class OptimizedDocumentProcessor:
                 self._enrich_clinical_metadata_simple(batch)
     
     def _enrich_with_advanced_nlp(self, chunks, batch_size):
-        """
-        Enhanced metadata enrichment using advanced NLP with direct UMLS linking
-        
-        Args:
-            chunks: List of document chunks to process
-            batch_size: Number of chunks to process at once
-            
-        Returns:
-            bool: True if successful, False if failed
-        """
+        """Enhanced metadata enrichment using advanced NLP with direct UMLS linking"""
         try:
             # Check if spaCy model is ready
             if self._spacy_nlp is None and not self._load_spacy_model():
@@ -392,83 +332,14 @@ class OptimizedDocumentProcessor:
                     "T127",  # Vitamin
                 ],
                 
-                # Procedures (PROC - Procedures semantic group)
-                "procedures": [
-                    "T060",  # Diagnostic Procedure
-                    "T065",  # Educational Activity
-                    "T058",  # Health Care Activity
-                    "T059",  # Laboratory Procedure
-                    "T063",  # Molecular Biology Research Technique
-                    "T062",  # Research Activity
-                    "T061",  # Therapeutic or Preventive Procedure
-                ],
-                
-                # Lab tests (PHEN - Phenomena semantic group, focused on lab results)
-                "lab_tests": [
-                    "T034",  # Laboratory or Test Result
-                    "T059",  # Laboratory Procedure (duplicate from procedures, but important for lab tests)
-                    "T201",  # Clinical Attribute (from PHYS group)
-                    "T067",  # Phenomenon or Process
-                ],
-                
-                # Anatomy (ANAT - Anatomy semantic group)
-                "anatomy": [
-                    "T017",  # Anatomical Structure
-                    "T029",  # Body Location or Region
-                    "T023",  # Body Part, Organ, or Organ Component
-                    "T030",  # Body Space or Junction
-                    "T031",  # Body Substance
-                    "T022",  # Body System
-                    "T025",  # Cell
-                    "T026",  # Cell Component
-                    "T018",  # Embryonic Structure
-                    "T021",  # Fully Formed Anatomical Structure
-                    "T024",  # Tissue
-                ],
-                
-                # Patient demographics (LIVB - Living Beings semantic group, focused on groups)
-                "demographics": [
-                    "T100",  # Age Group
-                    "T099",  # Family Group
-                    "T096",  # Group
-                    "T016",  # Human
-                    "T101",  # Patient or Disabled Group
-                    "T098",  # Population Group
-                    "T097",  # Professional or Occupational Group
-                ],
-                
-                # Devices (DEVI - Devices semantic group)
-                "devices": [
-                    "T203",  # Drug Delivery Device
-                    "T074",  # Medical Device
-                    "T075",  # Research Device
-                ],
-                
-                # Physiology (PHYS - Physiology semantic group)
-                "physiology": [
-                    "T043",  # Cell Function
-                    "T201",  # Clinical Attribute
-                    "T045",  # Genetic Function
-                    "T041",  # Mental Process
-                    "T044",  # Molecular Function
-                    "T032",  # Organism Attribute
-                    "T040",  # Organism Function
-                    "T042",  # Organ or Tissue Function
-                    "T039",  # Physiologic Function
-                ],
-                
-                # Activities & Behaviors (ACTI - Activities & Behaviors semantic group)
-                "behaviors": [
-                    "T052",  # Activity
-                    "T053",  # Behavior
-                    "T056",  # Daily or Recreational Activity
-                    "T051",  # Event
-                    "T064",  # Governmental or Regulatory Activity
-                    "T055",  # Individual Behavior
-                    "T066",  # Machine Activity
-                    "T057",  # Occupational Activity
-                    "T054",  # Social Behavior
-                ],
+                # Add the rest of the categories...
+                "procedures": ["T060", "T065", "T058", "T059", "T063", "T062", "T061"],
+                "lab_tests": ["T034", "T059", "T201", "T067"],
+                "anatomy": ["T017", "T029", "T023", "T030", "T031", "T022", "T025", "T026", "T018", "T021", "T024"],
+                "demographics": ["T100", "T099", "T096", "T016", "T101", "T098", "T097"],
+                "devices": ["T203", "T074", "T075"],
+                "physiology": ["T043", "T201", "T045", "T041", "T044", "T032", "T040", "T042", "T039"],
+                "behaviors": ["T052", "T053", "T056", "T051", "T064", "T055", "T066", "T057", "T054"],
             }
             
             # Process chunks in batches
@@ -533,7 +404,6 @@ class OptimizedDocumentProcessor:
                                             # Format is typically "T047_Disease_or_Syndrome"
                                             parts = type_string.split('_')
                                             if parts:
-                                                print(f"Extracted semantic type: {parts[0]} for CUI: {cui}")
                                                 semantic_types.append(parts[0])  # Extract "T047"
                                         
                                         # Create entity info
@@ -595,7 +465,7 @@ class OptimizedDocumentProcessor:
         except Exception as e:
             print(f"Advanced NLP enrichment failed: {e}")
             return False
-
+    
     def _map_entity_label_to_category(self, entity_label):
         """Map spaCy entity labels to our categories based on UMLS semantic groups"""
         # Map from standard scispaCy/spaCy entity types to our categories
@@ -650,96 +520,8 @@ class OptimizedDocumentProcessor:
         # Return the mapped category or None if no mapping exists
         return label_to_category.get(entity_label.upper(), None)
     
-    def _get_umls_entity_info(self, cui):
-        """
-        Get detailed information for a UMLS concept directly from the linker
-        
-        Args:
-            cui: UMLS Concept Unique Identifier
-                
-        Returns:
-            dict: Entity information including name, definition, and semantic types
-        """
-        if not self.config.use_umls_linking or self._umls_linker is None:
-            return {}
-        
-        try:
-            umls_entity = self._umls_linker.umls.cui_to_entity[cui]
-            
-            # Extract semantic types
-            semantic_types = []
-            for type_string in umls_entity.types:
-                parts = type_string.split('_')
-                if parts:
-                    semantic_types.append(parts[0])
-            
-            # Create entity info dictionary
-            entity_info = {
-                "cui": cui,
-                "name": umls_entity.canonical_name,
-                "definition": umls_entity.definition if umls_entity.definition else "",
-                "semantic_types": semantic_types,
-                "aliases": list(umls_entity.aliases)[:5]  # Limit to avoid excessive data
-            }
-            
-            return entity_info
-        except Exception as e:
-            print(f"Error fetching UMLS entity info for {cui}: {e}")
-            return {}
-    
-    def _get_semantic_types(self, cui):
-        """
-        Get semantic types for a UMLS concept ID using the MRSTY.RRF data
-        
-        Args:
-            cui: UMLS Concept Unique Identifier
-            
-        Returns:
-            List of semantic type codes (TUIs)
-        """
-        # First try to get from UMLS linker if available
-        if self.config.use_umls_linking and self._umls_linker:
-            try:
-                umls_entity = self._umls_linker.umls.cui_to_entity[cui]
-                semantic_types = []
-                for type_string in umls_entity.types:
-                    parts = type_string.split('_')
-                    if parts:
-                        semantic_types.append(parts[0])
-                return semantic_types
-            except Exception:
-                pass  # Fall back to MRSTY data
-        
-        # Check cache first for efficiency
-        if cui in self.semantic_type_cache:
-            return self.semantic_type_cache[cui]
-        
-        # Initialize semantic types list
-        semantic_types = []
-        
-        # Try to get semantic types from MRSTY.RRF data first
-        if not hasattr(self, 'semantic_type_map') or self.semantic_type_map is None:
-            if hasattr(self.config, 'mrsty_path') and self.config.mrsty_path:
-                self._load_umls_semantic_types()
-            else:
-                self.semantic_type_map = {}
-        
-        if cui in self.semantic_type_map:
-            # Extract just the TUIs
-            semantic_types = [st['tui'] for st in self.semantic_type_map[cui]]
-        
-        # Cache the result
-        self.semantic_type_cache[cui] = semantic_types
-        
-        return semantic_types
-    
     def _detect_recommendations(self, chunk):
-        """
-        Detect if a chunk contains clinical recommendations
-        
-        Args:
-            chunk: Document chunk to analyze
-        """
+        """Detect if a chunk contains clinical recommendations"""
         text = chunk.page_content.lower()
         
         # Check for recommendation patterns
@@ -804,7 +586,7 @@ class OptimizedDocumentProcessor:
             chunk.metadata["conditions_simple"] = [item["text"] for item in conditions]
             chunk.metadata["medications_simple"] = [item["text"] for item in medications]
             
-            # Initialize all categories for consistency (based on our UMLS semantic groups)
+            # Initialize all categories for consistency
             all_categories = [
                 "procedures", "lab_tests", "anatomy", "devices", 
                 "demographics", "physiology", "behaviors"
@@ -825,9 +607,11 @@ class OptimizedDocumentProcessor:
                 chunk.metadata["recommendation_strength"] = "unknown"
     
     def generate_embeddings(self, chunks, batch_size=None):
-        """Generate embeddings in batches to reduce memory usage"""
+        """Generate embeddings using Langchain's embedding model"""
         if batch_size is None:
             batch_size = self.config.batch_size
+        
+        print(f"Generating embeddings with batch size {batch_size}")
         
         all_embeddings = []
         
@@ -835,50 +619,74 @@ class OptimizedDocumentProcessor:
             batch = chunks[i:i+batch_size]
             texts = [chunk.page_content for chunk in batch]
             
-            # Generate embeddings for batch
-            batch_embeddings = self.embedding_model.encode(texts)
-            all_embeddings.append(batch_embeddings)
+            # Generate embeddings using Langchain's embedding model
+            batch_embeddings = self.langchain_embeddings.embed_documents(texts)
+            all_embeddings.extend(batch_embeddings)
             
             # Force garbage collection to free memory
             del texts
             gc.collect()
         
-        # Combine all batches
-        combined = np.vstack(all_embeddings)
+        # Convert to numpy array for operations like clustering
+        embeddings_array = np.array(all_embeddings)
         
         # Clean up to free memory
         del all_embeddings
         gc.collect()
         
-        return combined
+        return embeddings_array
     
-    def build_index(self, embeddings):
-        """Build optimized FAISS index based on dataset size"""
-        faiss = import_faiss()
-        dimension = embeddings.shape[1]
+    def build_index(self, chunks, embeddings=None):
+        """Build a Langchain vector store index using FAISS"""
+        LangchainFAISS, LangchainDocument, _ = import_langchain_vectorstores()
         
-        # Choose index type based on dataset size
-        if embeddings.shape[0] < 10000:
-            # For small datasets, use exact search (flat index)
-            index = faiss.IndexFlatL2(dimension)
+        # Convert chunks to Langchain Documents if needed
+        langchain_docs = []
+        for chunk in chunks:
+            # Check if it's already a Langchain Document
+            if not isinstance(chunk, LangchainDocument):
+                langchain_doc = LangchainDocument(
+                    page_content=chunk.page_content,
+                    metadata=chunk.metadata
+                )
+                langchain_docs.append(langchain_doc)
+            else:
+                langchain_docs.append(chunk)
+        
+        print(f"Building Langchain FAISS index with {len(langchain_docs)} documents")
+        
+        # If pre-computed embeddings are provided, use them
+        if embeddings is not None:
+            print("Using pre-computed embeddings")
+            # Convert numpy array to list of lists if needed
+            if isinstance(embeddings, np.ndarray):
+                embeddings_list = embeddings.tolist()
+            else:
+                embeddings_list = embeddings
+                
+            # Create FAISS from embeddings and documents
+            vectorstore = LangchainFAISS.from_embeddings(
+                embedding_pairs=list(zip([doc.page_content for doc in langchain_docs], embeddings_list)),
+                embedding=self.langchain_embeddings,
+                metadatas=[doc.metadata for doc in langchain_docs]
+            )
         else:
-            # For larger datasets, use IVF index with clustering for faster search
-            nlist = min(4096, int(4 * np.sqrt(embeddings.shape[0])))
-            quantizer = faiss.IndexFlatL2(dimension) 
-            index = faiss.IndexIVFFlat(quantizer, dimension, nlist)
-            index.train(embeddings)
+            # Create FAISS index directly from documents
+            print("Computing embeddings and building index")
+            vectorstore = LangchainFAISS.from_documents(
+                documents=langchain_docs,
+                embedding=self.langchain_embeddings
+            )
         
-        # Add vectors to index
-        index.add(embeddings)
-        
-        return index
+        print(f"Successfully built Langchain FAISS index")
+        return vectorstore
 
     def release_resources(self):
         """Release memory for heavy components"""
-        # Clear embedding model
-        if self._embedding_model is not None:
-            del self._embedding_model
-            self._embedding_model = None
+        # Clear langchain embeddings
+        if self._langchain_embeddings is not None:
+            del self._langchain_embeddings
+            self._langchain_embeddings = None
         
         # Clear spaCy and UMLS components
         if self._spacy_nlp is not None:
@@ -888,13 +696,10 @@ class OptimizedDocumentProcessor:
         # Force garbage collection
         gc.collect()
 
-# The rest of the code (OptimizedRetriever, OptimizedGenerator, OptimizedCache, OptimizedMCRAG, main function)
-# remains the same as in the original mcrag.py file
-
-# Optimized retriever with better search strategies
+# Optimized retriever with Langchain vector stores
 class OptimizedRetriever:
-    def __init__(self, index, chunks, embeddings, embedding_model):
-        self.index = index
+    def __init__(self, vectorstore, chunks=None, embeddings=None, embedding_model=None):
+        self.vectorstore = vectorstore
         self.chunks = chunks
         self.embeddings = embeddings
         self.embedding_model = embedding_model
@@ -913,88 +718,52 @@ class OptimizedRetriever:
             k: Number of chunks to retrieve
             diversity_factor: Factor to increase diverse results
         """
-        # Encode query efficiently
-        query_embedding = self.embedding_model.encode([query])
-        
         if mode == "random":
             return self._random_mode(k)
         elif mode == "top":
-            return self._top_mode(query_embedding, k)
+            return self._top_mode(query, k)
         elif mode == "diversity":
-            return self._diversity_mode(query_embedding, k, diversity_factor)
+            return self._diversity_mode(query, k, diversity_factor)
         elif mode == "class" or mode == "cluster":
-            return self._cluster_mode(query_embedding, k)
+            return self._cluster_mode(query, k)
         elif mode == "hybrid":
-            return self._hybrid_mode(query_embedding, k)
+            return self._hybrid_mode(query, k)
         else:
             raise ValueError(f"Unknown retrieval mode: {mode}")
     
     def _random_mode(self, k):
         """Random selection with unique results"""
         import random
-        indices = random.sample(range(len(self.chunks)), min(k, len(self.chunks)))
-        return [self.chunks[i] for i in indices]
+        if self.chunks:
+            indices = random.sample(range(len(self.chunks)), min(k, len(self.chunks)))
+            return [self.chunks[i] for i in indices]
+        else:
+            # If chunks aren't stored directly, get all documents from the vectorstore
+            all_docs = self.vectorstore.similarity_search("", k=1000)  # Get a large sample
+            indices = random.sample(range(len(all_docs)), min(k, len(all_docs)))
+            return [all_docs[i] for i in indices]
     
-    def _top_mode(self, query_embedding, k):
-        """Basic similarity search"""
-        distances, indices = self.index.search(query_embedding, k)
-        return [self.chunks[i] for i in indices[0]]
+    def _top_mode(self, query, k):
+        """Basic similarity search using Langchain's vector store"""
+        return self.vectorstore.similarity_search(query, k=k)
     
-    def _diversity_mode(self, query_embedding, k, diversity_factor):
-        """Maximum Marginal Relevance for diverse results"""
-        # Get a larger pool of candidates
-        top_k = min(k * diversity_factor, len(self.chunks))
-        distances, indices = self.index.search(query_embedding, top_k)
-        indices = indices[0]
-        
-        # Apply MMR algorithm
-        selected_indices = []
-        selected_embeddings = []
-        
-        # Add the most relevant result first
-        selected_indices.append(indices[0])
-        selected_embeddings.append(self.embeddings[indices[0]])
-        
-        # Select remaining documents
-        for _ in range(1, k):
-            if len(selected_indices) >= len(indices):
-                break
-                
-            max_diversity = -float('inf')
-            most_diverse_idx = -1
-            
-            for idx in indices:
-                if idx in selected_indices:
-                    continue
-                
-                # Calculate similarity to query
-                query_sim = 1.0 - distances[0][list(indices).index(idx)]
-                
-                # Calculate similarity to already selected documents
-                doc_embedding = self.embeddings[idx]
-                doc_sims = [np.dot(doc_embedding, sel_emb) / 
-                           (np.linalg.norm(doc_embedding) * np.linalg.norm(sel_emb)) 
-                           for sel_emb in selected_embeddings]
-                
-                max_doc_sim = max(doc_sims) if doc_sims else 0
-                
-                # Balance relevance and diversity
-                diversity_score = 0.7 * query_sim - 0.3 * max_doc_sim
-                
-                if diversity_score > max_diversity:
-                    max_diversity = diversity_score
-                    most_diverse_idx = idx
-            
-            if most_diverse_idx != -1:
-                selected_indices.append(most_diverse_idx)
-                selected_embeddings.append(self.embeddings[most_diverse_idx])
-        
-        return [self.chunks[i] for i in selected_indices]
+    def _diversity_mode(self, query, k, diversity_factor):
+        """Maximum Marginal Relevance for diverse results using Langchain's vector store"""
+        # Use Langchain's MMR retrieval
+        fetch_k = min(k * diversity_factor, 100)  # Avoid fetching too many
+        return self.vectorstore.max_marginal_relevance_search(
+            query, k=k, fetch_k=fetch_k
+        )
     
-    def _cluster_mode(self, query_embedding, k):
+    def _cluster_mode(self, query, k):
         """Retrieve from different clusters for better coverage"""
         try:
             from sklearn.cluster import KMeans
+            
+            # We need embeddings for clustering
+            if self.embeddings is None or self.chunks is None:
+                print("Cluster mode requires stored embeddings and chunks. Falling back to diversity mode.")
+                return self._diversity_mode(query, k, 3)
             
             # Create clusters if not already done
             if self._kmeans is None or self._cluster_labels is None:
@@ -1002,58 +771,269 @@ class OptimizedRetriever:
                 self._kmeans = KMeans(n_clusters=n_clusters, random_state=42)
                 self._cluster_labels = self._kmeans.fit_predict(self.embeddings)
             
-            # Get a larger pool of candidates
-            top_k = min(k * 3, len(self.chunks))
-            distances, indices = self.index.search(query_embedding, top_k)
-            indices = indices[0]
+            # Get top k*3 docs using Langchain's similarity search
+            top_docs = self.vectorstore.similarity_search(query, k=k*3)
+            
+            # Map docs back to original chunks to get indices
+            top_indices = []
+            for doc in top_docs:
+                # Find matching chunk by content and metadata
+                for i, chunk in enumerate(self.chunks):
+                    if (doc.page_content == chunk.page_content and 
+                        doc.metadata.get("source") == chunk.metadata.get("source")):
+                        top_indices.append(i)
+                        break
             
             # Get clusters of retrieved documents
-            retrieved_clusters = [self._cluster_labels[i] for i in indices]
+            retrieved_clusters = [self._cluster_labels[i] for i in top_indices if i < len(self._cluster_labels)]
             unique_clusters = list(set(retrieved_clusters))
             
             # Select top document from each cluster
-            selected_chunks = []
+            selected_docs = []
             for cluster in unique_clusters:
-                cluster_indices = [idx for i, idx in enumerate(indices) if retrieved_clusters[i] == cluster]
+                cluster_indices = [idx for i, idx in enumerate(top_indices) 
+                               if i < len(retrieved_clusters) and retrieved_clusters[i] == cluster]
                 if cluster_indices:
-                    selected_chunks.append(self.chunks[cluster_indices[0]])
-                    if len(selected_chunks) >= k:
+                    selected_docs.append(top_docs[top_indices.index(cluster_indices[0])])
+                    if len(selected_docs) >= k:
                         break
             
             # If we need more, add from top results
-            if len(selected_chunks) < k:
-                remaining_indices = [i for i in indices if self.chunks[i] not in selected_chunks]
-                selected_chunks.extend([self.chunks[i] for i in remaining_indices[:k-len(selected_chunks)]])
+            if len(selected_docs) < k:
+                remaining_docs = [doc for doc in top_docs if doc not in selected_docs]
+                selected_docs.extend(remaining_docs[:k-len(selected_docs)])
             
-            return selected_chunks
+            return selected_docs
         except ImportError:
             # Fallback if sklearn is not available
             print("Clustering not available, falling back to diversity mode")
-            return self._diversity_mode(query_embedding, k, 3)
+            return self._diversity_mode(query, k, 3)
     
-    def _hybrid_mode(self, query_embedding, k):
+    def _hybrid_mode(self, query, k):
         """Combine top and diversity modes for balanced results"""
         # Use half for top results, half for diverse results
         half_k = max(1, k // 2)
-        top_chunks = self._top_mode(query_embedding, half_k)
         
-        diversity_chunks = self._diversity_mode(query_embedding, k - half_k, 3)
+        # Get top results
+        top_docs = self._top_mode(query, half_k)
+        
+        # Get diverse results using MMR
+        diversity_docs = self._diversity_mode(query, k - half_k, 3)
         
         # Combine results, removing duplicates
         seen = set()
-        combined_chunks = []
+        combined_docs = []
         
-        for chunk in top_chunks + diversity_chunks:
-            chunk_id = id(chunk)
-            if chunk_id not in seen:
-                seen.add(chunk_id)
-                combined_chunks.append(chunk)
-                if len(combined_chunks) >= k:
+        for doc in top_docs + diversity_docs:
+            doc_id = hash(doc.page_content)  # Use content as hash key
+            if doc_id not in seen:
+                seen.add(doc_id)
+                combined_docs.append(doc)
+                if len(combined_docs) >= k:
                     break
         
-        return combined_chunks[:k]
+        return combined_docs[:k]
 
-# Optimized text generation
+# Optimized cache for Langchain vector stores
+class OptimizedCache:
+    """Efficient caching system with compression and incremental updates"""
+    
+    def __init__(self, cache_dir):
+        self.cache_dir = cache_dir
+        
+        # Create subdirectories
+        self.chunks_dir = os.path.join(cache_dir, "chunks")
+        self.embeddings_dir = os.path.join(cache_dir, "embeddings")
+        self.index_dir = os.path.join(cache_dir, "index")
+        
+        for d in [self.chunks_dir, self.embeddings_dir, self.index_dir]:
+            os.makedirs(d, exist_ok=True)
+        
+        # Maintain in-memory cache for frequently accessed small items
+        self.metadata_cache = {}
+        
+        print(f"Cache initialized at {cache_dir}")
+    
+    def generate_key(self, files, metadata=None):
+        """Generate a cache key with efficient hashing"""
+        # Use only filenames and modified times for faster processing
+        file_info = []
+        
+        # Process files in batches to avoid memory issues with large file lists
+        batch_size = 1000
+        sorted_files = sorted(files)
+        
+        for i in range(0, len(sorted_files), batch_size):
+            batch = sorted_files[i:i+batch_size]
+            for file_path in batch:
+                if os.path.exists(file_path):
+                    mtime = int(os.path.getmtime(file_path))
+                    file_size = os.path.getsize(file_path)
+                    # Use filename, size and mtime in hash
+                    file_info.append(f"{os.path.basename(file_path)}:{file_size}:{mtime}")
+        
+        # Add metadata hash if provided
+        if metadata:
+            if isinstance(metadata, dict):
+                # Sort keys for consistent hashing
+                metadata_str = json.dumps(
+                    {k: metadata[k] for k in sorted(metadata.keys())}, 
+                    sort_keys=True
+                )
+                file_info.append(metadata_str)
+            else:
+                file_info.append(str(metadata))
+        
+        # Create hash
+        key_string = "|".join(file_info)
+        cache_key = hashlib.md5(key_string.encode()).hexdigest()
+        
+        return cache_key
+    
+    def save_chunks(self, chunks, files, metadata=None):
+        """Save chunks to cache with compression"""
+        import pickle
+        import gzip
+        
+        # Generate key
+        cache_key = self.generate_key(files, metadata)
+        cache_path = os.path.join(self.chunks_dir, f"{cache_key}.pkl.gz")
+        
+        # Save metadata separately for quick access
+        meta_data = {
+            "count": len(chunks),
+            "sources": list(set(chunk.metadata.get("source", "unknown") for chunk in chunks)),
+            "timestamp": datetime.now().isoformat()
+        }
+        meta_path = os.path.join(self.chunks_dir, f"{cache_key}.meta.json")
+        
+        # Save compressed chunks
+        with gzip.open(cache_path, "wb", compresslevel=5) as f:
+            pickle.dump(chunks, f)
+        
+        # Save metadata
+        with open(meta_path, "w") as f:
+            json.dump(meta_data, f)
+        
+        # Update in-memory cache
+        self.metadata_cache[cache_key] = meta_data
+        
+        print(f"Cached {len(chunks)} chunks with key {cache_key}")
+        return cache_key
+    
+    def load_chunks(self, files, metadata=None):
+        """Load chunks from cache with compression support"""
+        import pickle
+        import gzip
+        
+        # Generate key
+        cache_key = self.generate_key(files, metadata)
+        cache_path = os.path.join(self.chunks_dir, f"{cache_key}.pkl.gz")
+        
+        if os.path.exists(cache_path):
+            try:
+                # Load compressed chunks
+                with gzip.open(cache_path, "rb") as f:
+                    chunks = pickle.load(f)
+                
+                print(f"Loaded {len(chunks)} chunks from cache (key: {cache_key})")
+                return chunks, True
+            except Exception as e:
+                print(f"Error loading cached chunks: {e}")
+        
+        return None, False
+    
+    def save_embeddings(self, embeddings, cache_key):
+        """Save embeddings with memory-efficient approach"""
+        # Save in compressed npz format
+        cache_path = os.path.join(self.embeddings_dir, f"{cache_key}.npz")
+        
+        # Convert to numpy array if it's a list
+        if isinstance(embeddings, list):
+            embeddings = np.array(embeddings)
+            
+        # Save embeddings
+        np.savez_compressed(cache_path, embeddings=embeddings)
+        print(f"Cached embeddings with shape {embeddings.shape}")
+    
+    def load_embeddings(self, cache_key):
+        """Load embeddings with memory-efficient approach"""
+        cache_path = os.path.join(self.embeddings_dir, f"{cache_key}.npz")
+        
+        if os.path.exists(cache_path):
+            try:
+                data = np.load(cache_path)
+                embeddings = data['embeddings']
+                print(f"Loaded embeddings with shape {embeddings.shape} from cache")
+                return embeddings, True
+            except Exception as e:
+                print(f"Error loading cached embeddings: {e}")
+        
+        return None, False
+    
+    # Updated to handle Langchain vector stores
+    def save_index(self, vectorstore, cache_key):
+        """Save Langchain FAISS vector store"""
+        cache_path = os.path.join(self.index_dir, f"{cache_key}")
+        
+        try:
+            # Save the vector store using Langchain's built-in functionality
+            vectorstore.save_local(cache_path)
+            print(f"Cached Langchain FAISS vector store with key {cache_key}")
+            return True
+        except Exception as e:
+            print(f"Error saving vector store: {e}")
+            return False
+    
+    def load_index(self, cache_key, embedding_model):
+        """Load Langchain FAISS vector store"""
+        LangchainFAISS, _, _ = import_langchain_vectorstores()
+        cache_path = os.path.join(self.index_dir, f"{cache_key}")
+        
+        if os.path.exists(cache_path):
+            try:
+                # Load the vector store with the embedding model
+                vectorstore = LangchainFAISS.load_local(cache_path, embedding_model, allow_dangerous_deserialization=True)
+                print(f"Loaded Langchain FAISS vector store from cache (key: {cache_key})")
+                return vectorstore, True
+            except Exception as e:
+                print(f"Error loading cached vector store: {e}")
+        
+        return None, False
+    
+    def clear_cache(self, older_than_days=None):
+        """Clear cache files with option to keep recent files"""
+        if older_than_days is not None:
+            # Calculate cutoff time
+            cutoff_time = datetime.now().timestamp() - (older_than_days * 86400)
+            
+            # Clear old files from each cache directory
+            for cache_dir in [self.chunks_dir, self.embeddings_dir, self.index_dir]:
+                for filename in os.listdir(cache_dir):
+                    filepath = os.path.join(cache_dir, filename)
+                    if os.path.isfile(filepath) and os.path.getmtime(filepath) < cutoff_time:
+                        try:
+                            os.remove(filepath)
+                            print(f"Removed old cache file: {filepath}")
+                        except Exception as e:
+                            print(f"Error removing cache file {filepath}: {e}")
+        else:
+            # Clear all cache
+            for cache_dir in [self.chunks_dir, self.embeddings_dir, self.index_dir]:
+                for filename in os.listdir(cache_dir):
+                    filepath = os.path.join(cache_dir, filename)
+                    if os.path.isfile(filepath):
+                        try:
+                            os.remove(filepath)
+                        except Exception as e:
+                            print(f"Error removing cache file {filepath}: {e}")
+            
+            # Clear in-memory cache
+            self.metadata_cache.clear()
+            
+            print("Cache cleared")
+
+# Text generation remains the same
 class OptimizedGenerator:
     def __init__(self, config: MCRAGConfig):
         self.config = config
@@ -1128,7 +1108,7 @@ class OptimizedGenerator:
                     device_map="auto"
                 )
     
-    def generate_recommendation(self, query, retrieved_chunks, max_length=512):
+    def generate_recommendation(self, query, retrieved_chunks, max_new_tokens=512):
         """Generate clinical recommendation with improved prompt and error handling"""
         # Format context from retrieved chunks
         context = self._format_context(retrieved_chunks)
@@ -1140,14 +1120,17 @@ class OptimizedGenerator:
         try:
             # Tokenize input
             inputs = self.tokenizer(prompt, return_tensors="pt")
+            input_length = len(inputs["input_ids"][0])
+            
+            print(f"Input length: {input_length} tokens")
             
             # Move to appropriate device
             device = self.config.device
             inputs = {k: v.to(device) for k, v in inputs.items()}
             
-            # Generation parameters optimized for clinical text
+            # Generation parameters optimized for clinical text - use max_new_tokens instead of max_length
             generation_config = {
-                "max_length": max_length,
+                "max_new_tokens": max_new_tokens,  # Generate this many new tokens regardless of input length
                 "do_sample": True,
                 "temperature": 0.7,
                 "top_p": 0.9,
@@ -1160,12 +1143,20 @@ class OptimizedGenerator:
                 try:
                     output = self.model.generate(**inputs, **generation_config)
                 except RuntimeError as e:
-                    if "CUDA out of memory" in str(e) or "MPS backend" in str(e):
+                    error_msg = str(e)
+                    if "CUDA out of memory" in error_msg or "MPS backend" in error_msg:
                         # Handle out-of-memory by reducing generation parameters
                         print(f"Memory error: {e}. Retrying with reduced parameters...")
                         
+                        # Check if we need to fall back to CPU for MPS-specific errors
+                        if "MPS backend" in error_msg and device == "mps":
+                            print("Falling back to CPU for MPS-specific error")
+                            if hasattr(self._model, "to"):
+                                self._model = self._model.to("cpu")
+                            inputs = {k: v.to("cpu") for k, v in inputs.items()}
+                        
                         # Reduce parameters to save memory
-                        generation_config["max_length"] = min(256, max_length)
+                        generation_config["max_new_tokens"] = 256
                         generation_config["do_sample"] = False
                         
                         # Retry generation
@@ -1318,196 +1309,7 @@ CLINICAL RECOMMENDATION:
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
         gc.collect()
 
-# Optimized caching system
-class OptimizedCache:
-    """Efficient caching system with compression and incremental updates"""
-    
-    def __init__(self, cache_dir):
-        self.cache_dir = cache_dir
-        
-        # Create subdirectories
-        self.chunks_dir = os.path.join(cache_dir, "chunks")
-        self.embeddings_dir = os.path.join(cache_dir, "embeddings")
-        self.index_dir = os.path.join(cache_dir, "index")
-        
-        for d in [self.chunks_dir, self.embeddings_dir, self.index_dir]:
-            os.makedirs(d, exist_ok=True)
-        
-        # Maintain in-memory cache for frequently accessed small items
-        self.metadata_cache = {}
-        
-        print(f"Cache initialized at {cache_dir}")
-    
-    def generate_key(self, files, metadata=None):
-        """Generate a cache key with efficient hashing"""
-        # Use only filenames and modified times for faster processing
-        file_info = []
-        
-        # Process files in batches to avoid memory issues with large file lists
-        batch_size = 1000
-        sorted_files = sorted(files)
-        
-        for i in range(0, len(sorted_files), batch_size):
-            batch = sorted_files[i:i+batch_size]
-            for file_path in batch:
-                if os.path.exists(file_path):
-                    mtime = int(os.path.getmtime(file_path))
-                    file_size = os.path.getsize(file_path)
-                    # Use filename, size and mtime in hash
-                    file_info.append(f"{os.path.basename(file_path)}:{file_size}:{mtime}")
-        
-        # Add metadata hash if provided
-        if metadata:
-            if isinstance(metadata, dict):
-                # Sort keys for consistent hashing
-                metadata_str = json.dumps(
-                    {k: metadata[k] for k in sorted(metadata.keys())}, 
-                    sort_keys=True
-                )
-                file_info.append(metadata_str)
-            else:
-                file_info.append(str(metadata))
-        
-        # Create hash
-        key_string = "|".join(file_info)
-        cache_key = hashlib.md5(key_string.encode()).hexdigest()
-        
-        return cache_key
-    
-    def save_chunks(self, chunks, files, metadata=None):
-        """Save chunks to cache with compression"""
-        import pickle
-        import gzip
-        
-        # Generate key
-        cache_key = self.generate_key(files, metadata)
-        cache_path = os.path.join(self.chunks_dir, f"{cache_key}.pkl.gz")
-        
-        # Save metadata separately for quick access
-        meta_data = {
-            "count": len(chunks),
-            "sources": list(set(chunk.metadata.get("source", "unknown") for chunk in chunks)),
-            "timestamp": datetime.now().isoformat()
-        }
-        meta_path = os.path.join(self.chunks_dir, f"{cache_key}.meta.json")
-        
-        # Save compressed chunks
-        with gzip.open(cache_path, "wb", compresslevel=5) as f:
-            pickle.dump(chunks, f)
-        
-        # Save metadata
-        with open(meta_path, "w") as f:
-            json.dump(meta_data, f)
-        
-        # Update in-memory cache
-        self.metadata_cache[cache_key] = meta_data
-        
-        print(f"Cached {len(chunks)} chunks with key {cache_key}")
-        return cache_key
-    
-    def load_chunks(self, files, metadata=None):
-        """Load chunks from cache with compression support"""
-        import pickle
-        import gzip
-        
-        # Generate key
-        cache_key = self.generate_key(files, metadata)
-        cache_path = os.path.join(self.chunks_dir, f"{cache_key}.pkl.gz")
-        
-        if os.path.exists(cache_path):
-            try:
-                # Load compressed chunks
-                with gzip.open(cache_path, "rb") as f:
-                    chunks = pickle.load(f)
-                
-                print(f"Loaded {len(chunks)} chunks from cache (key: {cache_key})")
-                return chunks, True
-            except Exception as e:
-                print(f"Error loading cached chunks: {e}")
-        
-        return None, False
-    
-    def save_embeddings(self, embeddings, cache_key):
-        """Save embeddings with memory-efficient approach"""
-        # Save in compressed npz format instead of raw npy
-        cache_path = os.path.join(self.embeddings_dir, f"{cache_key}.npz")
-        
-        # Save embeddings
-        np.savez_compressed(cache_path, embeddings=embeddings)
-        print(f"Cached embeddings with shape {embeddings.shape}")
-    
-    def load_embeddings(self, cache_key):
-        """Load embeddings with memory-efficient approach"""
-        cache_path = os.path.join(self.embeddings_dir, f"{cache_key}.npz")
-        
-        if os.path.exists(cache_path):
-            try:
-                data = np.load(cache_path)
-                embeddings = data['embeddings']
-                print(f"Loaded embeddings with shape {embeddings.shape} from cache")
-                return embeddings, True
-            except Exception as e:
-                print(f"Error loading cached embeddings: {e}")
-        
-        return None, False
-    
-    def save_index(self, index, cache_key):
-        """Save FAISS index"""
-        faiss = import_faiss()
-        cache_path = os.path.join(self.index_dir, f"{cache_key}.index")
-        
-        # Save index
-        faiss.write_index(index, cache_path)
-        print(f"Cached FAISS index with key {cache_key}")
-    
-    def load_index(self, cache_key):
-        """Load FAISS index"""
-        faiss = import_faiss()
-        cache_path = os.path.join(self.index_dir, f"{cache_key}.index")
-        
-        if os.path.exists(cache_path):
-            try:
-                index = faiss.read_index(cache_path)
-                print(f"Loaded FAISS index from cache (key: {cache_key})")
-                return index, True
-            except Exception as e:
-                print(f"Error loading cached index: {e}")
-        
-        return None, False
-    
-    def clear_cache(self, older_than_days=None):
-        """Clear cache files with option to keep recent files"""
-        if older_than_days is not None:
-            # Calculate cutoff time
-            cutoff_time = datetime.now().timestamp() - (older_than_days * 86400)
-            
-            # Clear old files from each cache directory
-            for cache_dir in [self.chunks_dir, self.embeddings_dir, self.index_dir]:
-                for filename in os.listdir(cache_dir):
-                    filepath = os.path.join(cache_dir, filename)
-                    if os.path.isfile(filepath) and os.path.getmtime(filepath) < cutoff_time:
-                        try:
-                            os.remove(filepath)
-                            print(f"Removed old cache file: {filepath}")
-                        except Exception as e:
-                            print(f"Error removing cache file {filepath}: {e}")
-        else:
-            # Clear all cache
-            for cache_dir in [self.chunks_dir, self.embeddings_dir, self.index_dir]:
-                for filename in os.listdir(cache_dir):
-                    filepath = os.path.join(cache_dir, filename)
-                    if os.path.isfile(filepath):
-                        try:
-                            os.remove(filepath)
-                        except Exception as e:
-                            print(f"Error removing cache file {filepath}: {e}")
-            
-            # Clear in-memory cache
-            self.metadata_cache.clear()
-            
-            print("Cache cleared")
-
-# Main system class
+# Main system class updated for Langchain vector stores
 class OptimizedMCRAG:
     def __init__(self, config: MCRAGConfig):
         self.config = config
@@ -1589,51 +1391,57 @@ class OptimizedMCRAG:
         
         print(f"Loaded {len(self.chunks)} document chunks")
         
-        # Generate or load embeddings
+        # Try to load vector store from cache first
+        vector_store_loaded = False
         if self.config.use_cache and self.cache and cache_key:
-            # Try to load embeddings
-            self.embeddings, emb_cache_hit = self.cache.load_embeddings(cache_key)
-            
-            if not emb_cache_hit:
-                # Generate and cache embeddings
-                print("Generating embeddings...")
-                self.embeddings = self.document_processor.generate_embeddings(
-                    self.chunks, 
-                    batch_size=self.config.batch_size
-                )
-                self.cache.save_embeddings(self.embeddings, cache_key)
-        else:
-            # Generate embeddings
-            print("Generating embeddings...")
-            self.embeddings = self.document_processor.generate_embeddings(
-                self.chunks, 
-                batch_size=self.config.batch_size
+            self.index, vector_store_loaded = self.cache.load_index(
+                cache_key, 
+                self.document_processor.langchain_embeddings
             )
-            if self.config.use_cache and self.cache and cache_key:
-                self.cache.save_embeddings(self.embeddings, cache_key)
         
-        # Build or load index
-        if self.config.use_cache and self.cache and cache_key:
-            self.index, index_cache_hit = self.cache.load_index(cache_key)
+        # If vector store wasn't in cache or cache is disabled
+        if not vector_store_loaded:
+            # Generate embeddings if needed for clustering/diversity search
+            if self.config.retrieval_mode in ["cluster", "diversity"]:
+                if self.config.use_cache and self.cache and cache_key:
+                    # Try to load embeddings for clustering
+                    self.embeddings, emb_cache_hit = self.cache.load_embeddings(cache_key)
+                    
+                    if not emb_cache_hit:
+                        # Generate and cache embeddings
+                        print("Generating embeddings for advanced search modes...")
+                        self.embeddings = self.document_processor.generate_embeddings(
+                            self.chunks, 
+                            batch_size=self.config.batch_size
+                        )
+                        self.cache.save_embeddings(self.embeddings, cache_key)
+                else:
+                    # Generate embeddings
+                    print("Generating embeddings for advanced search modes...")
+                    self.embeddings = self.document_processor.generate_embeddings(
+                        self.chunks, 
+                        batch_size=self.config.batch_size
+                    )
             
-            if not index_cache_hit:
-                # Build and cache index
-                print("Building index...")
-                self.index = self.document_processor.build_index(self.embeddings)
-                self.cache.save_index(self.index, cache_key)
-        else:
-            # Build index
-            print("Building index...")
-            self.index = self.document_processor.build_index(self.embeddings)
+            # Build Langchain vector store
+            print("Building Langchain vector store...")
+            if self.embeddings is not None:
+                # Use pre-computed embeddings
+                self.index = self.document_processor.build_index(self.chunks, self.embeddings)
+            else:
+                # Let Langchain compute embeddings
+                self.index = self.document_processor.build_index(self.chunks)
+            
+            # Cache the vector store
             if self.config.use_cache and self.cache and cache_key:
                 self.cache.save_index(self.index, cache_key)
         
-        # Initialize retriever
+        # Initialize retriever with Langchain vector store
         self.retriever = OptimizedRetriever(
-            index=self.index,
+            vectorstore=self.index,
             chunks=self.chunks,
             embeddings=self.embeddings,
-            embedding_model=self.document_processor.embedding_model
+            embedding_model=self.document_processor.langchain_embeddings
         )
         
         print("Data loading complete!")
@@ -1736,7 +1544,7 @@ class OptimizedMCRAG:
 
 # CLI interface
 def main():
-    parser = argparse.ArgumentParser(description="Optimized MC-RAG Clinical Decision Support System")
+    parser = argparse.ArgumentParser(description="Optimized MC-RAG Clinical Decision Support System with Langchain")
     
     # Setup subparsers for different commands
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
@@ -1873,4 +1681,9 @@ def main():
         parser.print_help()
 
 if __name__ == "__main__":
+    # Print a banner indicating this is the Langchain version
+    print("="*80)
+    print("MCRAG - Medical Context Retrieval Augmented Generation")
+    print("Langchain Vector Store Edition")
+    print("="*80)
     main()
